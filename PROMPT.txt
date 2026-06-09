@@ -1,0 +1,91 @@
+用 Rust + Axum 写一个静态资源服务。
+
+核心功能：
+- GET 请求路径映射到本地文件
+- 支持的静态文件类型：HTML、CSS、JS、图片（jpg/png/gif/webp/svg）、字体（woff/woff2/ttf）、视频（mp4/webm）、音频（mp3/ogg）、PDF、JSON、纯文本
+- 默认入口：访问 / 时返回 index.html
+
+性能优化：
+- ETag 头（基于文件 mtime 和 size 计算）
+- Last-Modified 头
+- If-None-Match 请求头处理（返回 304）
+- If-Modified-Since 请求头处理
+- Range 请求支持（视频拖动进度条用）
+- Content-Encoding 协商（gzip、br、deflate）
+- Cache-Control 头（max-age、immutable、no-cache）
+- Expires 头
+
+目录浏览：
+- 默认禁用（生产环境）
+- 可以通过配置启用
+- 启用时显示文件列表（文件名、大小、修改时间）
+- 列表按文件名/大小/时间排序
+- 列表支持分页（避免大目录卡）
+
+MIME 类型推断：
+- 按文件扩展名查 mime.types
+- 找不到的用 application/octet-stream
+- 字体文件特殊处理（font/woff、font/woff2 等）
+
+防盗链：
+- 检查 Referer header
+- 白名单域名配置
+- 不在白名单返回 403 或者重定向到指定图
+- 直接访问（无 Referer）默认放行（用户自己控制）
+
+安全：
+- 路径遍历攻击防护（GET /../etc/passwd 拒绝）
+- 符号链接默认不跟随（配置可开启）
+- 隐藏文件（.开头）默认不服务
+
+压缩：
+- 实时压缩（小文件）
+- 预压缩（启动时扫描 .gz/.br 文件，命中直接返回）
+- 压缩级别可配置
+
+健康检查：
+- GET /health 返回 200
+- 包含：服务运行时间、处理的请求数、当前活跃连接数
+
+至少 3 个文件：main.rs（启动）、handler.rs（文件处理）、security.rs（路径校验等）。依赖：axum、tokio、mime、async-compression（可选）。
+
+实际使用里会有这些细节：用户访问超大文件（10GB）不能爆内存（流式传输）；并发 1000 个 Range 请求要正确处理；路径里包含特殊字符（中文、空格、URL 编码）要正确解析；Range 越界（请求 bytes=1000000- 但文件只有 100 字节）返回 416；HEAD 请求只返回头不返回 body。
+
+
+
+时间维度和配额。临时分享链接生成后 24 小时过期，过期后文件仍存在但分享链接 404，原始访问者通过正常路径还能访问（分享链接是独立 token 不是文件属性）。缓存头按文件类型区分：HTML 文档 max-age=300（短缓存，强制 ETag 校验）、JS/CSS 带哈希文件名 max-age=31536000 immutable（一年长缓存）、普通图片 max-age=86400。文件预压缩 .gz/.br 启动时扫描一次，文件 mtime 变化要重新生成。月度带宽配额按 owner 维度累计，公共资源不算入个人配额。
+
+数据一致性。删除目录时子文件怎么办分两种：用户主动删除走递归删除（子文件物理删除不可恢复）；管理员审计删除走逻辑删除（子文件移到 /trash/:date/ 目录保留 30 天可恢复）。隐藏文件（点开头）改动后所有引用该文件的派生缓存要清（不能继续返回旧的 ETag 304）；同名 hash 命中的"内容相同但路径不同"文件做去重存储，原始文件删除时去重引用计数 -1，归零才物理删除。文件改名后旧 URL 在缓存过期前继续有效（带 301 重定向到新 URL），避免外链断链。
+
+实际部署里还会涉及这些点：Range 请求支持多范围（multipart/byteranges）。目录浏览分页（每页 100 项）。目录浏览搜索（按文件名）。防盗链 Referer 检查（支持通配符）。防盗链 fallback URL（被拒时重定向到指定图）。符号链接跟随（可配置）。路径遍历攻击深度限制（防止 /./././...）。压缩级别可配置。
+
+补段使用场景：用户用这个静态服务部署一个文档网站。访问 https://docs.example.com/ 返回 index.html，访问 /guide/getting-started.html 返回 getting-started 页面，访问 /assets/style.css 返回 CSS 文件，访问 /images/logo.png 返回 logo。
+
+性能：ETag 头（基于文件 mtime 和 size 计算），If-None-Match 返回 304。Last-Modified + If-Modified-Since 同样 304。Range 请求支持（视频拖进度条）。Content-Encoding 协商（gzip/br/deflate，按 Accept-Encoding 头）。Cache-Control 头（max-age、immutable、no-cache）。
+
+目录浏览：默认禁用（生产环境）。启用时显示文件列表（文件名、大小、修改时间），按文件名/大小/时间排序，分页（每页 100 项）。
+
+MIME 推断：按扩展名查 mime.types，字体特殊处理（font/woff 等）。防盗链：检查 Referer，白名单域名配置，不在白名单 403 或者重定向 fallback 图。安全：路径遍历攻击防护（GET /../etc/passwd 拒绝），符号链接默认不跟随（可配置）。
+
+静态文件服务用 tower-http 的 ServeDir 或者 ServeFile。文件 hash 命名（main.abc123.js），cache-control: public, max-age=31536000, immutable。HTML 文件 cache-control: no-cache 强制校验 ETag。
+
+SPA 路由 fallback：访问 /users/123 这种前端路由时 fallback 到 /index.html 让前端 router 处理。fallback 策略：所有非文件路径（没有扩展名）都 fallback，文件路径 404 时不 fallback 直接返回 404。Content-Type 自动按扩展名映射：.html → text/html, .js → application/javascript, .css → text/css, .json → application/json, .png → image/png。
+
+性能：gzip / br 压缩，ServerTiming 头告诉前端资源加载时间。安全：X-Content-Type-Options: nosniff，X-Frame-Options: DENY 防止 clickjacking。
+
+性能优化：gzip 压缩级别 6（压缩比/速度平衡），br 压缩级别 4。Cache-Control 头按文件类型区分：HTML 短缓存（max-age=300）、JS/CSS 哈希文件名长缓存（max-age=31536000, immutable）、图片中缓存（max-age=86400）。Range 请求支持大文件分片下载。
+
+文件预加载：HTML 引用关键 CSS/JS 资源响应头加 Link: </style.css>; rel=preload。Range 请求支持断点续传。错误处理：404 / 403 / 500 走自定义错误页。
+
+性能优化：gzip 压缩级别 6。HTML 短缓存、JS/CSS 哈希文件名长缓存、图片中缓存。
+
+缓存策略：HTML 文档 cache-control: no-cache 强制校验 ETag，JS/CSS 带 hash 文件名 cache-control: public, max-age=31536000, immutable，普通图片 cache-control: public, max-age=86400。性能优化：gzip 压缩级别 6（压缩比和速度平衡），br 压缩级别 4，文件预加载用 Link: </style.css>; rel=preload。Range 请求支持断点续传大文件下载。错误处理：404、403、500 走自定义错误页。安全：X-Content-Type-Options: nosniff 防 MIME 嗅探，X-Frame-Options: DENY 防 clickjacking。
+
+性能监控：ServerTiming 头告诉前端资源加载时间。
+
+完整工程目录分层：handlers、middleware、config、metrics 拆分。ServerTiming 监控每个文件加载时长。
+
+ServerTiming 头监控资源加载耗时。安全策略：nosniff、DENY 全套配置齐备。
+实际工作流里文档站点上的资源有完整发布流程：文件从"已上传"走到"已发布"中间要经过"扫描中—隔离中—已发布—已归档"几个状态；扫描中触发杀毒/敏感词检查，命中问题的文件进入"隔离中"对外不可见；管理员审核后才能"已发布"或永久删除。文件状态迁移规则：扫描超时强制标记"扫描失败"并隔离；管理员审核通过后从"隔离中"回到"已发布"；被举报多次的文件自动降级到"已归档"。
+
+按角色看到的资源不同。普通访客只能看 public 目录下标记 is_public 的资源。登录用户除公开资源外能看到自己上传的私密资源（path 前缀 /uploads/:user_id/）。管理员看所有资源+删除权限，且能看到每个资源的扫描状态、举报次数、违规标记。审计员调只读接口查所有资源访问日志，能看 IP、UA、Referer、访问时间，但看不到 owner 的真实姓名（脱敏后只展示账号 ID）。
