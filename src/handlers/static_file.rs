@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use async_compression::tokio::write::{BrotliEncoder, DeflateEncoder, GzipEncoder};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use tracing::debug;
 
@@ -272,13 +273,19 @@ impl StaticFileHandler {
         if self.compression_config.enabled
             && is_compressible(&mime)
             && metadata.len() >= self.compression_config.min_size as u64
-            && metadata.len() <= self.compression_config.max_size as u64
         {
             if let Some(encoding) = self.negotiate_encoding(path, accept_encoding) {
                 self.metrics.increment_compressed_responses();
-                return self
-                    .serve_compressed(path, &mime, &etag, &last_modified, encoding)
-                    .await;
+                if encoding.ends_with("-pre") {
+                    let enc = encoding.trim_end_matches("-pre");
+                    return self
+                        .serve_precompressed(path, &mime, &etag, &last_modified, enc)
+                        .await;
+                } else {
+                    return self
+                        .serve_realtime_compressed(path, &metadata, &mime, &etag, &last_modified, encoding)
+                        .await;
+                }
             }
         }
 
@@ -302,6 +309,7 @@ impl StaticFileHandler {
                     return true;
                 }
             }
+            return false;
         }
 
         if let Some(if_modified_since) = headers
@@ -310,7 +318,15 @@ impl StaticFileHandler {
         {
             if let Ok(since) = parse_http_date(if_modified_since) {
                 if let Ok(modified) = metadata.modified() {
-                    if modified <= since {
+                    let modified_secs = modified
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let since_secs = since
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if modified_secs <= since_secs {
                         return true;
                     }
                 }
@@ -328,15 +344,25 @@ impl StaticFileHandler {
             if accept_lower.contains("br") {
                 let br_path = PathBuf::from(format!("{}.br", path.display()));
                 if br_path.exists() {
-                    return Some("br");
+                    return Some("br-pre");
                 }
             }
             if accept_lower.contains("gzip") {
                 let gz_path = PathBuf::from(format!("{}.gz", path.display()));
                 if gz_path.exists() {
-                    return Some("gzip");
+                    return Some("gzip-pre");
                 }
             }
+        }
+
+        if accept_lower.contains("br") {
+            return Some("br");
+        }
+        if accept_lower.contains("gzip") {
+            return Some("gzip");
+        }
+        if accept_lower.contains("deflate") {
+            return Some("deflate");
         }
 
         None
@@ -430,7 +456,7 @@ impl StaticFileHandler {
         }
     }
 
-    async fn serve_compressed(
+    async fn serve_precompressed(
         &self,
         original_path: &Path,
         mime: &mime::Mime,
@@ -495,12 +521,117 @@ impl StaticFileHandler {
                     header::ACCEPT_RANGES,
                     HeaderValue::from_static("none"),
                 );
+                headers.insert(
+                    header::VARY,
+                    HeaderValue::from_static("Accept-Encoding"),
+                );
 
                 self.metrics.add_bytes_sent(content_length);
 
                 response
             }
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
+    async fn serve_realtime_compressed(
+        &self,
+        path: &Path,
+        metadata: &Metadata,
+        mime: &mime::Mime,
+        etag: &str,
+        last_modified: &str,
+        encoding: &'static str,
+    ) -> Response {
+        let mut file = match File::open(path).await {
+            Ok(f) => f,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+        let mut content = Vec::with_capacity(metadata.len() as usize);
+        if let Err(_) = file.read_to_end(&mut content).await {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        let compressed = match self.compress_bytes(&content, encoding).await {
+            Ok(c) => c,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+        let cache_directives = self.cache_policy.get_cache_control(path);
+        let content_length = compressed.len() as u64;
+
+        let mut response = Response::new(Body::from(compressed));
+        let headers = response.headers_mut();
+
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(mime.as_ref()).unwrap(),
+        );
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from(content_length),
+        );
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static(encoding),
+        );
+        headers.insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
+        headers.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_str(last_modified).unwrap(),
+        );
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_str(&cache_directives.to_header_value()).unwrap(),
+        );
+        headers.insert(
+            header::ACCEPT_RANGES,
+            HeaderValue::from_static("none"),
+        );
+        headers.insert(
+            header::VARY,
+            HeaderValue::from_static("Accept-Encoding"),
+        );
+
+        self.metrics.add_bytes_sent(content_length);
+
+        response
+    }
+
+    async fn compress_bytes(&self, data: &[u8], encoding: &str) -> Result<Vec<u8>, std::io::Error> {
+        match encoding {
+            "gzip" => {
+                let mut encoder = GzipEncoder::with_quality(
+                    Vec::new(),
+                    async_compression::Level::Precise(self.compression_config.gzip_level as i32),
+                );
+                encoder.write_all(data).await?;
+                encoder.shutdown().await?;
+                Ok(encoder.into_inner())
+            }
+            "br" => {
+                let mut encoder = BrotliEncoder::with_quality(
+                    Vec::new(),
+                    async_compression::Level::Precise(self.compression_config.brotli_level as i32),
+                );
+                encoder.write_all(data).await?;
+                encoder.shutdown().await?;
+                Ok(encoder.into_inner())
+            }
+            "deflate" => {
+                let mut encoder = DeflateEncoder::with_quality(
+                    Vec::new(),
+                    async_compression::Level::Precise(self.compression_config.deflate_level as i32),
+                );
+                encoder.write_all(data).await?;
+                encoder.shutdown().await?;
+                Ok(encoder.into_inner())
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsupported encoding",
+            )),
         }
     }
 
@@ -747,7 +878,7 @@ fn parse_http_date(s: &str) -> Result<SystemTime, ()> {
 
 fn parse_rfc1123(s: &str) -> Option<SystemTime> {
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() != 5 {
+    if parts.len() < 5 {
         return None;
     }
 

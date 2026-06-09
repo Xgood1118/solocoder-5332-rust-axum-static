@@ -76,7 +76,7 @@ impl Default for CompressionConfig {
             brotli_level: 4,
             deflate_level: 6,
             precompressed: true,
-            min_size: 1024,
+            min_size: 256,
             max_size: 10 * 1024 * 1024,
         }
     }

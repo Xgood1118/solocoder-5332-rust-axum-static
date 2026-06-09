@@ -28,6 +28,7 @@ walkdir = "2.0"
 dashmap = "5.0"
 parking_lot = "0.12"
 async-stream = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "deflate"] }
 clap = { version = "4.0", features = ["derive"] }
 
 [dev-dependencies]

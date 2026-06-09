@@ -1,0 +1,1 @@
+有两个问题。第一个是浏览器带 If-Modified-Since 头来的时候，本地测试文件没改也会拿到 200 + 完整 body，协商缓存压根没生效，跑了下没看到 304。第二个是Accept-Encoding 带了 br/gzip，服务端也认了，但响应里 Content-Encoding 这块永远不见踪影，JS/CSS 全是裸传的。检查修复一下。
